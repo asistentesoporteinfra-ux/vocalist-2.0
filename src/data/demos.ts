@@ -218,7 +218,7 @@ export const demos: readonly DemoItem[] = [
       "El cliente llama para pedir o reservar. El agente toma el pedido completo, sugiere el combo que sube el ticket y confirma en menos de 90 segundos.",
     sectorId: "restaurant",
     sectorLabel: "Restaurante",
-    audioUrl: "/demos/restaurante/liz-burger.mp3",
+    audioUrl: "/demos/restaurante/burger-liz.mp3",
     durationLabel: "02:32",
     accent: "linear-gradient(135deg, #fb923c, #ef4444)",
   },
