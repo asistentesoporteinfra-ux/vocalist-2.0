@@ -26,7 +26,22 @@ type AudioGraph = {
   output: GainNode;
 };
 
-const playbackRates = [0.9, 1, 1.1, 1.25, 1.3] as const;
+const playbackRates = [0.9, 1, 1.1, 1.25] as const;
+
+// Volumen inicial alto — los archivos de voz IA salen normalizados a -14 LUFS,
+// necesitan boost agresivo para sonar a nivel de conversación normal.
+const INITIAL_VOLUME = 1.0;
+
+// Makeup gain para compensar la reducción del compresor y el ReplayGain
+// embebido en los MP3 generados por herramientas TTS (ElevenLabs, etc.).
+// Con ratio 2.0 y threshold -10dB la reducción máxima es ~6dB → necesitamos
+// al menos 2.0x de makeup gain para estar por encima del nivel original.
+const MAKEUP_GAIN_ENHANCED = 3.2;
+const MAKEUP_GAIN_NORMAL   = 2.5;
+
+// El slider de volumen va de 0 a 1 en la UI pero internamente se mapea
+// a 0..MAX_GAIN para que "al máximo" realmente suene máximo.
+const MAX_GAIN = 3.5;
 
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
@@ -39,6 +54,10 @@ function formatRate(rate: number): string {
   return `${rate.toFixed(rate % 1 === 0 ? 0 : 1)}x`;
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
 function applyAudioSettings(
   audio: HTMLAudioElement,
   graph: AudioGraph | null,
@@ -47,26 +66,46 @@ function applyAudioSettings(
   playbackRate: number,
 ) {
   if (graph) {
-    graph.highPass.frequency.value = enabled ? 82 : 24;
-    graph.highPass.Q.value = 0.68;
-    graph.presence.frequency.value = 3300;
-    graph.presence.Q.value = 0.9;
-    graph.presence.gain.value = enabled ? 3.4 : 0;
-    graph.compressor.threshold.value = enabled ? -16 : -30;
-    graph.compressor.knee.value = enabled ? 12 : 0;
-    graph.compressor.ratio.value = enabled ? 2.8 : 1;
-    graph.compressor.attack.value = enabled ? 0.002 : 0.003;
-    graph.compressor.release.value = enabled ? 0.12 : 0.1;
-    graph.output.gain.value = Math.min(volume * (enabled ? 1.55 : 1), 2.5);
+    // ── High-pass: elimina rumble de fondo en voz IA ──────────────────────
+    graph.highPass.type = "highpass";
+    graph.highPass.frequency.value = enabled ? 80 : 20;
+    graph.highPass.Q.value = 0.7;
+
+    // ── Presence boost: claridad en frecuencias de voz (2-4 kHz) ─────────
+    graph.presence.type = "peaking";
+    graph.presence.frequency.value = 3000;
+    graph.presence.Q.value = 0.85;
+    graph.presence.gain.value = enabled ? 4.5 : 0;
+
+    // ── Compresor: suaviza picos pero con threshold alto para no aplastar ─
+    // ANTES era threshold -20dB ratio 3.2 → aplastaba todo el cuerpo de voz
+    // AHORA threshold -10dB ratio 2.0 → solo recorta picos reales
+    graph.compressor.threshold.value = enabled ? -10 : -6;
+    graph.compressor.knee.value      = enabled ? 18  : 6;
+    graph.compressor.ratio.value     = enabled ? 2.0 : 1.1;
+    graph.compressor.attack.value    = enabled ? 0.004 : 0.01;
+    graph.compressor.release.value   = enabled ? 0.15  : 0.25;
+
+    // ── Output gain: makeup gain agresivo + volumen del usuario ───────────
+    // volume (0-1 de la UI) × MAKEUP_GAIN × MAX_GAIN
+    // Ejemplo al 100% con mejora: 1.0 × 3.2 × 3.5 = 11.2 → clamp a 4.0
+    // Ejemplo al 50%: 0.5 × 3.2 × 3.5 = 5.6 → clamp a 4.0
+    // clamp a 4.0 para evitar distorsión digital en parlantes normales
+    const makeup = enabled ? MAKEUP_GAIN_ENHANCED : MAKEUP_GAIN_NORMAL;
+    graph.output.gain.value = clamp(volume * makeup * MAX_GAIN, 0, 4.0);
+
+    // El elemento <audio> siempre a 1 — todo el control va por el GainNode
     audio.volume = 1;
     audio.playbackRate = playbackRate;
-    audio.preservesPitch = true;
+    // Preservar pitch al cambiar velocidad (evita efecto chipmunk)
+    (audio as HTMLAudioElement & { preservesPitch?: boolean; webkitPreservePitch?: boolean }).preservesPitch = true;
+    (audio as HTMLAudioElement & { preservesPitch?: boolean; webkitPreservePitch?: boolean }).webkitPreservePitch = true;
     return;
   }
 
-  audio.volume = Math.min(volume, 1);
+  // Fallback sin Web Audio API: subir volume del elemento directamente al máximo
+  audio.volume = clamp(volume * 1.0, 0, 1); // sin grafo, el máximo es 1
   audio.playbackRate = playbackRate;
-  audio.preservesPitch = true;
 }
 
 export function AudioDemoCard({
@@ -74,23 +113,15 @@ export function AudioDemoCard({
   trackNumber,
   compact = false,
 }: AudioDemoCardProps) {
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const graphRef = useRef<AudioGraph | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [volume, setVolume] = useState(() => {
-    if (typeof window === "undefined") return 1;
-    const saved = localStorage.getItem("vocalis_volume");
-    return saved !== null ? parseFloat(saved) : 1;
-  });
-  const [playbackRate, setPlaybackRate] = useState(() => {
-    if (typeof window === "undefined") return 1;
-    const saved = localStorage.getItem("vocalis_speed");
-    return saved !== null ? parseFloat(saved) : 1;
-  });
-  const [isEnhanced, setIsEnhanced] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const audioRef   = useRef<HTMLAudioElement>(null);
+  const graphRef   = useRef<AudioGraph | null>(null);
+  const [isPlaying,    setIsPlaying]    = useState(false);
+  const [currentTime,  setCurrentTime]  = useState(0);
+  const [duration,     setDuration]     = useState(0);
+  const [volume,       setVolume]       = useState(INITIAL_VOLUME);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [isEnhanced,   setIsEnhanced]   = useState(true);
+  const [error,        setError]        = useState<string | null>(null);
   const accentStyle = { "--demo-gradient": demo.accent } as CSSProperties;
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
 
@@ -100,12 +131,12 @@ export function AudioDemoCard({
       return null;
     }
 
-    const context = new window.AudioContext();
-    const source = context.createMediaElementSource(audio);
-    const highPass = context.createBiquadFilter();
-    const presence = context.createBiquadFilter();
+    const context    = new window.AudioContext();
+    const source     = context.createMediaElementSource(audio);
+    const highPass   = context.createBiquadFilter();
+    const presence   = context.createBiquadFilter();
     const compressor = context.createDynamicsCompressor();
-    const output = context.createGain();
+    const output     = context.createGain();
 
     source.connect(highPass);
     highPass.connect(presence);
@@ -118,19 +149,21 @@ export function AudioDemoCard({
     return graphRef.current;
   };
 
+  // Re-aplicar settings cada vez que cambia volumen, velocidad o modo
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
     applyAudioSettings(audio, graphRef.current, isEnhanced, volume, playbackRate);
   }, [isEnhanced, playbackRate, volume]);
 
+  // Eventos del elemento <audio>
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
-    const onMeta = () => setDuration(audio.duration || 0);
-    const onTime = () => setCurrentTime(audio.currentTime || 0);
-    const onPlay = () => {
+    const onMeta  = () => setDuration(audio.duration || 0);
+    const onTime  = () => setCurrentTime(audio.currentTime || 0);
+    const onPlay  = () => {
       setIsPlaying(true);
       setError(null);
       if (activeAudio && activeAudio !== audio) {
@@ -140,16 +173,12 @@ export function AudioDemoCard({
     };
     const onPause = () => {
       setIsPlaying(false);
-      if (activeAudio === audio) {
-        activeAudio = null;
-      }
+      if (activeAudio === audio) activeAudio = null;
     };
-    const onEnd = () => {
+    const onEnd   = () => {
       setIsPlaying(false);
       setCurrentTime(0);
-      if (activeAudio === audio) {
-        activeAudio = null;
-      }
+      if (activeAudio === audio) activeAudio = null;
     };
     const onError = () => {
       setError("No se pudo cargar esta demo.");
@@ -157,42 +186,30 @@ export function AudioDemoCard({
     };
 
     audio.addEventListener("loadedmetadata", onMeta);
-    audio.addEventListener("timeupdate", onTime);
-    audio.addEventListener("play", onPlay);
-    audio.addEventListener("pause", onPause);
-    audio.addEventListener("ended", onEnd);
-    audio.addEventListener("error", onError);
+    audio.addEventListener("timeupdate",     onTime);
+    audio.addEventListener("play",           onPlay);
+    audio.addEventListener("pause",          onPause);
+    audio.addEventListener("ended",          onEnd);
+    audio.addEventListener("error",          onError);
     return () => {
       audio.removeEventListener("loadedmetadata", onMeta);
-      audio.removeEventListener("timeupdate", onTime);
-      audio.removeEventListener("play", onPlay);
-      audio.removeEventListener("pause", onPause);
-      audio.removeEventListener("ended", onEnd);
-      audio.removeEventListener("error", onError);
+      audio.removeEventListener("timeupdate",     onTime);
+      audio.removeEventListener("play",           onPlay);
+      audio.removeEventListener("pause",          onPause);
+      audio.removeEventListener("ended",          onEnd);
+      audio.removeEventListener("error",          onError);
     };
   }, []);
 
+  // Cleanup al desmontar
   useEffect(() => {
     const audio = audioRef.current;
     return () => {
       audio?.pause();
-      if (activeAudio === audio) {
-        activeAudio = null;
-      }
+      if (activeAudio === audio) activeAudio = null;
       graphRef.current?.context.close().catch(() => undefined);
       graphRef.current = null;
     };
-  }, []);
-
-  useEffect(() => {
-    const handler = () => {
-      const g = graphRef.current;
-      if (g?.context.state === "suspended") {
-        g.context.resume().catch(() => undefined);
-      }
-    };
-    document.addEventListener("click", handler, { once: true });
-    return () => document.removeEventListener("click", handler);
   }, []);
 
   const handleToggle = async () => {
@@ -200,13 +217,11 @@ export function AudioDemoCard({
     if (!audio) return;
 
     if (audio.paused) {
-      if (isEnhanced || graphRef.current) {
-        const graph = await ensureGraph();
-        if (graph?.context.state === "suspended") {
-          await graph.context.resume();
-        }
+      // Siempre crear el grafo al dar play — garantiza que el boost esté activo
+      const graph = await ensureGraph();
+      if (graph?.context.state === "suspended") {
+        await graph.context.resume();
       }
-
       try {
         await audio.play();
       } catch {
@@ -230,22 +245,18 @@ export function AudioDemoCard({
   };
 
   const handleSeek = (e: ChangeEvent<HTMLInputElement>) => {
-    const audio = audioRef.current;
+    const audio    = audioRef.current;
     const nextTime = Number(e.target.value);
     if (audio) audio.currentTime = nextTime;
     setCurrentTime(nextTime);
   };
 
   const handleVolume = (e: ChangeEvent<HTMLInputElement>) => {
-    const v = Number(e.target.value);
-    setVolume(v);
-    localStorage.setItem("vocalis_volume", v.toString());
+    setVolume(Number(e.target.value));
   };
 
   const handleRate = (e: ChangeEvent<HTMLSelectElement>) => {
-    const r = Number(e.target.value);
-    setPlaybackRate(r);
-    localStorage.setItem("vocalis_speed", r.toString());
+    setPlaybackRate(Number(e.target.value));
   };
 
   return (
@@ -303,7 +314,7 @@ export function AudioDemoCard({
               aria-label="Volumen"
               type="range"
               min={0}
-              max={2}
+              max={1}
               step={0.01}
               value={volume}
               onChange={handleVolume}
@@ -337,7 +348,13 @@ export function AudioDemoCard({
 
       <span className="trackRow__duration">{demo.durationLabel}</span>
 
-      <audio ref={audioRef} preload="metadata" playsInline src={demo.audioUrl} />
+      <audio
+        ref={audioRef}
+        preload="metadata"
+        playsInline
+        crossOrigin="anonymous"
+        src={demo.audioUrl}
+      />
     </article>
   );
 }
