@@ -26,7 +26,7 @@ type AudioGraph = {
   output: GainNode;
 };
 
-const playbackRates = [0.9, 1, 1.1, 1.25] as const;
+const playbackRates = [0.9, 1, 1.1, 1.25, 1.3] as const;
 
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
@@ -57,14 +57,16 @@ function applyAudioSettings(
     graph.compressor.ratio.value = enabled ? 2.8 : 1;
     graph.compressor.attack.value = enabled ? 0.002 : 0.003;
     graph.compressor.release.value = enabled ? 0.12 : 0.1;
-    graph.output.gain.value = volume * (enabled ? 1.55 : 1);
+    graph.output.gain.value = Math.min(volume * (enabled ? 1.55 : 1), 2.5);
     audio.volume = 1;
     audio.playbackRate = playbackRate;
+    audio.preservesPitch = true;
     return;
   }
 
-  audio.volume = volume;
+  audio.volume = Math.min(volume, 1);
   audio.playbackRate = playbackRate;
+  audio.preservesPitch = true;
 }
 
 export function AudioDemoCard({
@@ -77,8 +79,16 @@ export function AudioDemoCard({
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [volume, setVolume] = useState(1);
-  const [playbackRate, setPlaybackRate] = useState(1);
+  const [volume, setVolume] = useState(() => {
+    if (typeof window === "undefined") return 1;
+    const saved = localStorage.getItem("vocalis_volume");
+    return saved !== null ? parseFloat(saved) : 1;
+  });
+  const [playbackRate, setPlaybackRate] = useState(() => {
+    if (typeof window === "undefined") return 1;
+    const saved = localStorage.getItem("vocalis_speed");
+    return saved !== null ? parseFloat(saved) : 1;
+  });
   const [isEnhanced, setIsEnhanced] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const accentStyle = { "--demo-gradient": demo.accent } as CSSProperties;
@@ -174,6 +184,17 @@ export function AudioDemoCard({
     };
   }, []);
 
+  useEffect(() => {
+    const handler = () => {
+      const g = graphRef.current;
+      if (g?.context.state === "suspended") {
+        g.context.resume().catch(() => undefined);
+      }
+    };
+    document.addEventListener("click", handler, { once: true });
+    return () => document.removeEventListener("click", handler);
+  }, []);
+
   const handleToggle = async () => {
     const audio = audioRef.current;
     if (!audio) return;
@@ -216,11 +237,15 @@ export function AudioDemoCard({
   };
 
   const handleVolume = (e: ChangeEvent<HTMLInputElement>) => {
-    setVolume(Number(e.target.value));
+    const v = Number(e.target.value);
+    setVolume(v);
+    localStorage.setItem("vocalis_volume", v.toString());
   };
 
   const handleRate = (e: ChangeEvent<HTMLSelectElement>) => {
-    setPlaybackRate(Number(e.target.value));
+    const r = Number(e.target.value);
+    setPlaybackRate(r);
+    localStorage.setItem("vocalis_speed", r.toString());
   };
 
   return (
@@ -278,7 +303,7 @@ export function AudioDemoCard({
               aria-label="Volumen"
               type="range"
               min={0}
-              max={1}
+              max={2}
               step={0.01}
               value={volume}
               onChange={handleVolume}
